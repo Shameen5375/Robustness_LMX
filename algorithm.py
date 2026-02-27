@@ -16,8 +16,14 @@ from sentiment_lmx.metrics.scoring import compute_semantic_distance, compute_sen
 class MapElites2D:
     """
     MAP-Elites with 2D grid:
-    - X axis: Sentiment strength
+    - X axis: Sentiment strength (single-model or worst-case across evaluators)
     - Y axis: Semantic divergence
+
+    When robustness_mode=True the fitness criterion switches from the
+    single optimization-model score to the worst-case P(positive) across
+    all three independently trained evaluators (DistilBERT-SST2,
+    RoBERTa-Twitter, BERT-SST2).  Genomes that fail any evaluator are
+    disfavoured, pushing the search toward evaluator-invariant solutions.
     """
 
     def __init__(
@@ -27,9 +33,15 @@ class MapElites2D:
         grid_size=(20, 20),
         temperature=0.7,
         batch_size=8,
+        robustness_mode: bool = False,
     ):
         """
         Initialize MAP-Elites 2D.
+
+        Args:
+            robustness_mode: If True, use worst-case P(positive) across all
+                evaluators as the fitness criterion instead of the single
+                optimization-model score.
         """
         self.root_sentence = root_sentence
         self.root_embedding = None
@@ -38,10 +50,13 @@ class MapElites2D:
         self.grid_rows, self.grid_cols = grid_size
         self.temperature = temperature
         self.batch_size = batch_size
+        self.robustness_mode = robustness_mode
 
         self.grid = {}
         self.num_evals = 0
         self.log = []
+
+        self._evaluators = None  # lazily loaded when robustness_mode=True
 
         self._ensure_root_embedding()
         self._insert(root_sentence)
@@ -49,6 +64,7 @@ class MapElites2D:
         print(f"   Grid: {self.grid_rows}{self.grid_cols} = {self.grid_rows * self.grid_cols} cells")
         print(f"   Target sentiment: {target_sentiment}")
         print(f"   Temperature: {temperature}")
+        print(f"   Robustness mode: {robustness_mode}")
 
     def _ensure_root_embedding(self):
         if self.root_embedding is None:
@@ -56,6 +72,42 @@ class MapElites2D:
 
             _, _, embed = models.load_default_models()
             self.root_embedding = embed.encode([self.root_sentence])[0]
+
+    def _load_evaluators(self):
+        """Lazily load the three independent evaluators for robustness mode."""
+        if self._evaluators is None:
+            from sentiment_lmx.crossover_analysis import (
+                DEFAULT_EVALUATOR_MODELS,
+                get_device,
+                load_evaluators,
+            )
+
+            device = get_device()
+            print("   Loading robustness evaluators...")
+            self._evaluators = load_evaluators(DEFAULT_EVALUATOR_MODELS, device)
+        return self._evaluators
+
+    def _compute_fitness(self, genome: str) -> float:
+        """
+        Compute the fitness score used for grid insertion and replacement.
+
+        robustness_mode=False (baseline):
+            Single-model P(positive) from the optimization evaluator.
+
+        robustness_mode=True (robustness-aware):
+            Worst-case P(positive) across all three evaluators — a
+            conservative lower bound that disfavours genomes that fail
+            under any one classifier.
+        """
+        if self.robustness_mode:
+            from sentiment_lmx.crossover_analysis import cross_model_metrics, score_all_models
+
+            evaluators = self._load_evaluators()
+            scores = score_all_models(genome, evaluators)
+            metrics = cross_model_metrics(scores)
+            return metrics["worst_posprob"]
+        else:
+            return compute_sentiment_score(genome, self.target_sentiment)
 
     def _coords_to_bin(self, sentiment, divergence):
         """Convert continuous coordinates to grid bin."""
@@ -68,18 +120,23 @@ class MapElites2D:
         return (row, col)
 
     def _insert(self, genome):
-        """Evaluate and insert genome into grid if it improves cell."""
-        sentiment = compute_sentiment_score(genome, self.target_sentiment)
+        """
+        Evaluate and insert genome into grid if it improves the cell.
+
+        The fitness used for both cell placement and replacement is
+        determined by _compute_fitness(), which respects robustness_mode.
+        """
+        fitness = self._compute_fitness(genome)
         divergence = compute_semantic_distance(genome, self.root_embedding)
 
         self.num_evals += 1
 
-        bin_key = self._coords_to_bin(sentiment, divergence)
+        bin_key = self._coords_to_bin(fitness, divergence)
 
-        if bin_key not in self.grid or self.grid[bin_key]["sentiment"] < sentiment:
+        if bin_key not in self.grid or self.grid[bin_key]["sentiment"] < fitness:
             self.grid[bin_key] = {
                 "genome": genome,
-                "sentiment": sentiment,
+                "sentiment": fitness,
                 "divergence": divergence,
             }
             return True
@@ -191,6 +248,7 @@ class MapElites2D:
                 "grid_size": (self.grid_rows, self.grid_cols),
                 "temperature": self.temperature,
                 "batch_size": self.batch_size,
+                "robustness_mode": self.robustness_mode,
             },
             "grid": grid_export,
             "log": self.log,
